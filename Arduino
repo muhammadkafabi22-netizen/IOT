@@ -1,0 +1,88 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ================= WIFI =================
+const char* ssid = "WISMA 45D";
+const char* password = "sarwoendah3";
+
+// ================= THINGSPEAK =================
+String apiKey = "XN6294ET7Y30S4Y0";
+const char* server = "http://api.thingspeak.com/update";
+
+// ================= LDR =================
+const int ldrPin = 34;
+
+// ================= TIMER =================
+unsigned long previousRead = 0;
+unsigned long previousSend = 0;
+
+const unsigned long readInterval = 1000;
+const unsigned long sendInterval = 20000;
+
+// ================= DATA =================
+int adcAsli = 0;
+int nilaiCahaya = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  analogReadResolution(12);
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Menghubungkan WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Terhubung!");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Membaca sensor setiap 1 detik
+  if (currentMillis - previousRead >= readInterval) {
+    previousRead = currentMillis;
+
+    adcAsli = analogRead(ldrPin);
+    nilaiCahaya = 4095 - adcAsli;
+
+    Serial.print("ADC Asli: ");
+    Serial.print(adcAsli);
+
+    Serial.print(" | Intensitas Cahaya: ");
+    Serial.println(nilaiCahaya);
+  }
+
+  // Mengirim data setiap 20 detik
+  if (currentMillis - previousSend >= sendInterval) {
+    previousSend = currentMillis;
+
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+
+      String url = String(server) +
+                   "?api_key=" + apiKey +
+                   "&field1=" + String(nilaiCahaya);
+
+      http.begin(url);
+
+      int httpCode = http.GET();
+
+      if (httpCode > 0) {
+        Serial.print("Data terkirim! Response: ");
+        Serial.println(http.getString());
+      } else {
+        Serial.print("Gagal mengirim: ");
+        Serial.println(httpCode);
+      }
+
+      http.end();
+    } else {
+      Serial.println("WiFi terputus!");
+    }
+  }
+}
