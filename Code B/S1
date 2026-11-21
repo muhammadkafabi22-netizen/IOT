@@ -1,0 +1,293 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <algorithm>
+#include <math.h>
+
+// =====================================
+// KONFIGURASI WIFI
+// =====================================
+
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+
+#define LDR_PIN 34
+
+// =====================================
+// KONFIGURASI HTTP
+// =====================================
+
+const char* serverURL = "http://httpbin.org/post";
+
+const int TOTAL_PESAN = 100;
+const int PAYLOAD_SIZE = 20;
+const int INTERVAL = 2000;
+const int TIMEOUT = 5000;
+
+float dataRTT[TOTAL_PESAN];
+
+int berhasil = 0;
+int gagal = 0;
+
+// =====================================
+// KONEKSI WIFI
+// =====================================
+
+void connectWiFi() {
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  Serial.println("Menghubungkan WiFi...");
+
+  WiFi.begin(ssid, password, 6);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Terhubung!");
+}
+
+// =====================================
+// MEMBUAT PAYLOAD 20 BYTE
+// =====================================
+
+String createPayload(int seq, int ldr) {
+
+  char buffer[30];
+
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "S1,%04d,%04d",
+    seq,
+    ldr
+  );
+
+  String payload = buffer;
+
+  while (payload.length() < PAYLOAD_SIZE) {
+    payload += "X";
+  }
+
+  return payload.substring(0, PAYLOAD_SIZE);
+}
+
+// =====================================
+// PERHITUNGAN STATISTIK RTT
+// =====================================
+
+void calculateRTT() {
+
+  if (berhasil == 0) {
+    Serial.println("Tidak ada RTT berhasil diukur.");
+    return;
+  }
+
+  int n = berhasil;
+
+  float total = 0;
+
+  for (int i = 0; i < n; i++) {
+    total += dataRTT[i];
+  }
+
+  float mean = total / n;
+
+  std::sort(dataRTT, dataRTT + n);
+
+  float median;
+
+  if (n % 2 == 0) {
+    median = (
+      dataRTT[n / 2 - 1] +
+      dataRTT[n / 2]
+    ) / 2.0;
+  } else {
+    median = dataRTT[n / 2];
+  }
+
+  float variance = 0;
+
+  for (int i = 0; i < n; i++) {
+    variance += pow(dataRTT[i] - mean, 2);
+  }
+
+  float stdDev = sqrt(variance / n);
+
+  int index = (int)ceil(0.95 * n) - 1;
+
+  if (index >= n) {
+    index = n - 1;
+  }
+
+  float p95 = dataRTT[index];
+
+  float pdr =
+    (float)berhasil / TOTAL_PESAN * 100.0;
+
+  Serial.println();
+  Serial.println("========== HASIL S1 ==========");
+
+  Serial.print("Pesan dikirim : ");
+  Serial.println(TOTAL_PESAN);
+
+  Serial.print("Berhasil      : ");
+  Serial.println(berhasil);
+
+  Serial.print("Gagal         : ");
+  Serial.println(gagal);
+
+  Serial.print("PDR           : ");
+  Serial.print(pdr);
+  Serial.println(" %");
+
+  Serial.print("RTT Mean      : ");
+  Serial.print(mean);
+  Serial.println(" ms");
+
+  Serial.print("RTT Median    : ");
+  Serial.print(median);
+  Serial.println(" ms");
+
+  Serial.print("RTT Std Dev   : ");
+  Serial.print(stdDev);
+  Serial.println(" ms");
+
+  Serial.print("RTT P95       : ");
+  Serial.print(p95);
+  Serial.println(" ms");
+
+  Serial.println("==============================");
+}
+
+// =====================================
+// PENGUJIAN HTTP POST S1
+// =====================================
+
+void testHTTP_S1() {
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       PENGUJIAN S1");
+  Serial.println("================================");
+
+  Serial.println("Protokol : HTTP POST");
+  Serial.println("Payload  : 20 byte");
+  Serial.println("Pesan    : 100");
+  Serial.println("Interval : 2 detik");
+  Serial.println("Timeout  : 5 detik");
+
+  berhasil = 0;
+  gagal = 0;
+
+  for (int i = 0; i < TOTAL_PESAN; i++) {
+
+    connectWiFi();
+
+    int ldr = analogRead(LDR_PIN);
+
+    String payload = createPayload(i + 1, ldr);
+
+    WiFiClient client;
+    HTTPClient http;
+
+    http.setTimeout(TIMEOUT);
+    http.setConnectTimeout(TIMEOUT);
+    http.setReuse(false);
+
+    unsigned long startTime = millis();
+
+    int httpCode = -1;
+
+    if (http.begin(client, serverURL)) {
+
+      http.addHeader(
+        "Content-Type",
+        "text/plain"
+      );
+
+      httpCode = http.POST(payload);
+
+    }
+
+    unsigned long endTime = millis();
+
+    float rtt = endTime - startTime;
+
+    if (httpCode >= 200 && httpCode < 300) {
+
+      dataRTT[berhasil] = rtt;
+      berhasil++;
+
+      Serial.print("SEQ: ");
+      Serial.print(i + 1);
+
+      Serial.print(" | LDR: ");
+      Serial.print(ldr);
+
+      Serial.print(" | RTT: ");
+      Serial.print(rtt);
+
+      Serial.println(" ms | SUCCESS");
+
+    } else {
+
+      gagal++;
+
+      Serial.print("SEQ: ");
+      Serial.print(i + 1);
+
+      Serial.print(" | HTTP CODE: ");
+      Serial.print(httpCode);
+
+      Serial.println(" | FAILED");
+
+    }
+
+    http.end();
+
+    delay(INTERVAL);
+  }
+
+  calculateRTT();
+}
+
+// =====================================
+// SETUP
+// =====================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  analogReadResolution(12);
+
+  Serial.println();
+  Serial.println("SISTEM PENGUJIAN HTTP DAN MQTT");
+
+  connectWiFi();
+
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("RSSI: ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+
+  testHTTP_S1();
+
+  Serial.println();
+  Serial.println("PENGUJIAN S1 SELESAI");
+
+}
+
+// =====================================
+// LOOP
+// =====================================
+
+void loop() {
+
+}
