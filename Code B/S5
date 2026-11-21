@@ -1,0 +1,407 @@
+
+#include <WiFi.h>
+#include <MQTT.h>
+#include <algorithm>
+#include <math.h>
+
+// WIFI
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+
+// MQTT BROKER
+const char* mqttServer = "test.mosquitto.org";
+const int mqttPort = 1883;
+
+// PARAMETER S5
+const int TOTAL_PESAN = 100;
+const int PAYLOAD_SIZE = 20;
+const unsigned long INTERVAL = 2000;
+const unsigned long TIMEOUT = 5000;
+
+const int LDR_PIN = 34;
+
+// DUA KONEKSI MQTT
+WiFiClient wifiPub;
+WiFiClient wifiSub;
+
+MQTTClient mqttPub(256);
+MQTTClient mqttSub(256);
+
+// TOPIC
+String topicData;
+String topicReply;
+
+// STATISTIK
+float rttData[TOTAL_PESAN];
+int jumlahBerhasil = 0;
+int jumlahGagal = 0;
+
+// STATUS PESAN
+bool gotReply = false;
+int waitingSeq = -1;
+unsigned long waktuKirim = 0;
+unsigned long receivedRTT = 0;
+
+// ECHO
+String pendingEcho = "";
+
+// MEMBUAT PAYLOAD 20 BYTE
+String createPayload(int seq, int ldr) {
+  char buffer[PAYLOAD_SIZE + 1];
+
+  snprintf(buffer, sizeof(buffer), "S5,%04d,%04d", seq, ldr);
+
+  String payload = String(buffer);
+
+  while (payload.length() < PAYLOAD_SIZE) {
+    payload += "X";
+  }
+
+  return payload;
+}
+
+// CALLBACK SUBSCRIBER
+void subscriberCallback(String &topic, String &payload) {
+
+  if (topic == topicData && payload.length() == PAYLOAD_SIZE) {
+    pendingEcho = payload;
+  }
+}
+
+// CALLBACK PUBLISHER
+void publisherCallback(String &topic, String &payload) {
+
+  if (topic != topicReply) return;
+  if (payload.length() != PAYLOAD_SIZE) return;
+  if (payload.substring(0, 3) != "S5,") return;
+
+  int seq = payload.substring(3, 7).toInt();
+
+  if (seq == waitingSeq && !gotReply) {
+    receivedRTT = millis() - waktuKirim;
+    gotReply = true;
+  }
+}
+
+// KONEKSI MQTT
+bool connectMQTT() {
+
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+
+  topicData = "pengujian/s5/" + mac + "/data";
+  topicReply = "pengujian/s5/" + mac + "/reply";
+
+  mqttPub.begin(mqttServer, mqttPort, wifiPub);
+  mqttSub.begin(mqttServer, mqttPort, wifiSub);
+
+  mqttPub.setOptions(30, true, 5000);
+  mqttSub.setOptions(30, true, 5000);
+
+  mqttPub.onMessage(publisherCallback);
+  mqttSub.onMessage(subscriberCallback);
+
+  String idSub = "S5_SUB_" + mac;
+  String idPub = "S5_PUB_" + mac;
+
+  Serial.println("Menghubungkan MQTT...");
+
+  if (!mqttSub.connect(idSub.c_str())) {
+    Serial.println("Subscriber gagal terhubung");
+    return false;
+  }
+
+  if (!mqttSub.subscribe(topicData, 0)) {
+    Serial.println("Subscribe data gagal");
+    return false;
+  }
+
+  if (!mqttPub.connect(idPub.c_str())) {
+    Serial.println("Publisher gagal terhubung");
+    return false;
+  }
+
+  if (!mqttPub.subscribe(topicReply, 0)) {
+    Serial.println("Subscribe reply gagal");
+    return false;
+  }
+
+  Serial.println("MQTT CONNECTED");
+  Serial.println("Publisher dan Subscriber siap");
+  Serial.println("Publish QoS: 1");
+
+  // Menunggu subscription diproses broker
+  unsigned long awal = millis();
+
+  while (millis() - awal < 1500) {
+    mqttPub.loop();
+    mqttSub.loop();
+    delay(5);
+  }
+
+  return true;
+}
+
+// MENJAGA KONEKSI
+bool ensureMQTT() {
+
+  if (mqttPub.connected() && mqttSub.connected()) {
+    return true;
+  }
+
+  Serial.println("Koneksi terputus. Reconnecting...");
+
+  mqttPub.disconnect();
+  mqttSub.disconnect();
+
+  for (int i = 1; i <= 3; i++) {
+
+    Serial.print("Reconnect ke-");
+    Serial.println(i);
+
+    if (connectMQTT()) {
+      return true;
+    }
+
+    delay(1000);
+  }
+
+  return false;
+}
+
+// STATISTIK
+void tampilkanHasil() {
+
+  float data[TOTAL_PESAN];
+
+  for (int i = 0; i < jumlahBerhasil; i++) {
+    data[i] = rttData[i];
+  }
+
+  float mean = 0;
+  float median = 0;
+  float stdDev = 0;
+  float p95 = 0;
+
+  if (jumlahBerhasil > 0) {
+
+    std::sort(data, data + jumlahBerhasil);
+
+    float total = 0;
+
+    for (int i = 0; i < jumlahBerhasil; i++) {
+      total += data[i];
+    }
+
+    mean = total / jumlahBerhasil;
+
+    if (jumlahBerhasil % 2 == 0) {
+      median = (data[jumlahBerhasil / 2 - 1] +
+                data[jumlahBerhasil / 2]) / 2.0;
+    } else {
+      median = data[jumlahBerhasil / 2];
+    }
+
+    float variance = 0;
+
+    for (int i = 0; i < jumlahBerhasil; i++) {
+      variance += pow(data[i] - mean, 2);
+    }
+
+    stdDev = sqrt(variance / jumlahBerhasil);
+
+    int indexP95 = ceil(0.95 * jumlahBerhasil) - 1;
+
+    if (indexP95 < 0) indexP95 = 0;
+    if (indexP95 >= jumlahBerhasil) {
+      indexP95 = jumlahBerhasil - 1;
+    }
+
+    p95 = data[indexP95];
+  }
+
+  float pdr = (float)jumlahBerhasil /
+              TOTAL_PESAN * 100.0;
+
+  Serial.println("\n========== HASIL S5 ==========");
+
+  Serial.print("Pesan dikirim : ");
+  Serial.println(TOTAL_PESAN);
+
+  Serial.print("Berhasil      : ");
+  Serial.println(jumlahBerhasil);
+
+  Serial.print("Gagal         : ");
+  Serial.println(jumlahGagal);
+
+  Serial.print("PDR           : ");
+  Serial.print(pdr, 2);
+  Serial.println(" %");
+
+  Serial.print("RTT Mean      : ");
+  Serial.print(mean, 2);
+  Serial.println(" ms");
+
+  Serial.print("RTT Median    : ");
+  Serial.print(median, 2);
+  Serial.println(" ms");
+
+  Serial.print("RTT Std Dev   : ");
+  Serial.print(stdDev, 2);
+  Serial.println(" ms");
+
+  Serial.print("RTT P95        : ");
+  Serial.print(p95, 2);
+  Serial.println(" ms");
+
+  Serial.println("==============================");
+  Serial.println("\nPENGUJIAN S5 SELESAI");
+}
+
+// PENGUJIAN S5
+void testMQTT_S5() {
+
+  Serial.println("\n===== PENGUJIAN S5 =====");
+  Serial.println("Protokol : MQTT");
+  Serial.println("QoS      : 1");
+  Serial.println("Payload  : 20 Byte");
+  Serial.println("Pesan    : 100");
+
+  for (int seq = 1; seq <= TOTAL_PESAN; seq++) {
+
+    if (!ensureMQTT()) {
+      Serial.println("Koneksi gagal. Pengujian dihentikan.");
+      jumlahGagal += TOTAL_PESAN - seq + 1;
+      break;
+    }
+
+    int ldrValue = analogRead(LDR_PIN);
+    String payload = createPayload(seq, ldrValue);
+
+    waitingSeq = seq;
+    gotReply = false;
+    pendingEcho = "";
+
+    waktuKirim = millis();
+
+    // PUBLISH MENGGUNAKAN QoS 1
+    bool sent = mqttPub.publish(
+      topicData,
+      payload,
+      false,
+      1
+    );
+
+    Serial.print("Pesan ");
+    Serial.print(seq);
+    Serial.print(" | Payload: ");
+    Serial.print(payload.length());
+    Serial.print(" byte | QoS: 1 | ");
+
+    if (!sent) {
+
+      jumlahGagal++;
+      Serial.println("PUBLISH / PUBACK GAGAL");
+
+    } else {
+
+      unsigned long awalTunggu = millis();
+
+      while (!gotReply &&
+             millis() - awalTunggu < TIMEOUT) {
+
+        mqttSub.loop();
+        mqttPub.loop();
+
+        // Subscriber mengirim echo QoS 0
+        if (pendingEcho.length() > 0) {
+
+          String echo = pendingEcho;
+          pendingEcho = "";
+
+          mqttSub.publish(
+            topicReply,
+            echo,
+            false,
+            0
+          );
+        }
+
+        delay(2);
+      }
+
+      if (gotReply) {
+
+        rttData[jumlahBerhasil] = receivedRTT;
+        jumlahBerhasil++;
+
+        Serial.print("RTT: ");
+        Serial.print(receivedRTT);
+        Serial.println(" ms | BERHASIL");
+
+      } else {
+
+        jumlahGagal++;
+        Serial.println("TIMEOUT / GAGAL");
+      }
+    }
+
+    waitingSeq = -1;
+
+    // INTERVAL 2 DETIK ANTARPESAN
+    if (seq < TOTAL_PESAN) {
+
+      unsigned long mulaiInterval = millis();
+
+      while (millis() - mulaiInterval < INTERVAL) {
+        mqttPub.loop();
+        mqttSub.loop();
+
+        if (pendingEcho.length() > 0) {
+          pendingEcho = "";
+        }
+
+        delay(5);
+      }
+    }
+  }
+
+  tampilkanHasil();
+}
+
+void setup() {
+
+  Serial.begin(115200);
+  pinMode(LDR_PIN, INPUT);
+
+  Serial.println("\n===== S5 MQTT QoS 1 =====");
+
+  WiFi.begin(ssid, password, 6);
+
+  Serial.print("Menghubungkan WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected");
+
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("RSSI: ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+
+  if (connectMQTT()) {
+    testMQTT_S5();
+  } else {
+    Serial.println("MQTT gagal terhubung.");
+  }
+}
+
+void loop() {
+  mqttPub.loop();
+  mqttSub.loop();
+}
